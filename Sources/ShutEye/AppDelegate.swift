@@ -4,9 +4,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusItem: NSStatusItem!
     private let monitor = ClamshellMonitor()
-    private let enabledKey = "HiSleepEnabled"
-    private let lastSleepKey = "HiSleepLastForcedSleep"
-    private let lastSleepCountKey = "HiSleepLastForcedSleepBlockers"
+    private let enabledKey = "ShutEyeEnabled"
+    private let lastSleepKey = "ShutEyeLastForcedSleep"
+    private let lastSleepCountKey = "ShutEyeLastForcedSleepBlockers"
 
     private let lastSleepFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -17,6 +17,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 两次强制睡之间的最小间隔。既防唤醒后一直醒着,也防 sleep→wake→sleep 高频抖动。
     private let minSleepInterval: TimeInterval = 20
     private var lastForcedAt: Date?
+
+    /// 睡眠失败(如 SleepDisabled 没复位、pmset 被拒)后的退避窗口。这类失败往往是持久的,
+    /// 合盖期间通知可能反复触发,没有退避就会反复砸 pmset、刷屏日志。
+    private let failBackoff: TimeInterval = 10
+    private var lastFailedAt: Date?
+
+    /// 合盖轮询:每隔 pollInterval 秒主动看一次盖子状态。比单纯依赖 IOPM 事件通知更可靠
+    /// (某些机器通知不触发)。合着就尝试睡,冷却/退避负责防抖。
+    private let pollInterval: TimeInterval = 3
+    private var pollTimer: Timer?
+    /// 上一次轮询时盖子是否合着,用于只在状态变化时记一条日志(避免每 3s 刷屏)。
+    private var pollLastClosed = false
 
     /// 解析后的拦睡者:带真实 App 名和图标(代持场景已穿透到真凶)。
     private struct DisplayBlocker {
@@ -46,8 +58,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitor.onShouldSleep = { [weak self] in self?.handleShouldSleep() }
         monitor.start()
 
+        // 主动轮询合盖状态,绕开 IOPM 事件通知可能不触发的问题
+        let timer = Timer.scheduledTimer(timeInterval: pollInterval, target: self,
+                                         selector: #selector(pollClamshell),
+                                         userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
+
         updateIcon()
-        Log.write("已启动,合盖强制睡眠 = \(enabled)")
+        Log.write("已启动,合盖强制睡眠 = \(enabled),每 \(Int(pollInterval))s 轮询合盖")
+    }
+
+    /// 定时轮询:盖子合着就交给统一的睡眠逻辑(handleShouldSleep 内含守卫+冷却+退避)。
+    /// 盖子开着时安静跳过;合↔开状态变化时各记一条日志,方便你从日志看出它在工作。
+    @objc private func pollClamshell() {
+        guard enabled else { return }
+        let closed = PowerInfo.clamshellClosed()
+        if closed != pollLastClosed {
+            Log.write(closed ? "轮询:检测到合盖" : "轮询:检测到开盖")
+            pollLastClosed = closed
+        }
+        guard closed else { return }
+        handleShouldSleep()
     }
 
     // MARK: - 拦睡者解析(穿透代持 → 真实 App 名 + 图标)
@@ -80,11 +112,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func handleShouldSleep() {
         guard enabled else { Log.write("合盖但功能已关闭,不动作"); return }
 
-        // 冷却:距上次强制睡不足 minSleepInterval 则跳过(防抖,也防唤醒后反复睡)
+        // 冷却:距上次成功强制睡不足 minSleepInterval 则跳过(防抖,也防唤醒后反复睡)
         if let last = lastForcedAt {
             let gap = Date().timeIntervalSince(last)
             if gap < minSleepInterval {
                 Log.write("合盖但冷却中(距上次 \(Int(gap))s < \(Int(minSleepInterval))s),跳过")
+                return
+            }
+        }
+        // 失败退避:上次睡眠失败后短时间内不重试,避免持久失败(如 SleepDisabled 没复位)反复砸 pmset
+        if let failed = lastFailedAt {
+            let gap = Date().timeIntervalSince(failed)
+            if gap < failBackoff {
+                Log.write("合盖但上次睡眠失败,退避中(\(Int(gap))s < \(Int(failBackoff))s),跳过")
                 return
             }
         }
@@ -99,17 +139,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let summary = raw.map { PowerInfo.processName(for: $0.culpritPID) ?? $0.ownerName }
             .joined(separator: ", ")
 
-        lastForcedAt = Date()
-        UserDefaults.standard.set(Date(), forKey: lastSleepKey)
-        UserDefaults.standard.set(raw.count, forKey: lastSleepCountKey)
         // 同步写,确保证据在机器睡着前已落盘
-        Log.writeSync("守卫通过 → pmset sleepnow。拦睡 \(raw.count): \(summary)")
+        Log.writeSync("守卫通过 → 准备强制睡眠。拦睡 \(raw.count): \(summary)")
 
-        // 强制睡放后台线程,绝不阻塞主线程的菜单/合盖状态机
+        // 实际睡眠放后台线程,绝不阻塞主线程的菜单/合盖状态机
+        let blockerCount = raw.count
         DispatchQueue.global(qos: .userInitiated).async {
-            let ok = PowerInfo.forceSleep()
-            Log.write(ok ? "pmset 睡眠请求已发出(退出码 0)" : "pmset 失败,未睡成")
+            self.performForceSleep(blockerCount: blockerCount)
         }
+    }
+
+    /// 后台线程执行的强制睡眠,自动合盖与手动「立即睡眠」共用。
+    /// 先处理 SleepDisabled:这是系统级持久设置(常被 ToDesk 等远程软件用 `pmset -a disablesleep 1`
+    /// 设上),开着时连 root 的 `pmset sleepnow` 都会被拒,且杀进程清不掉它,必须用特权命令复位。
+    private func performForceSleep(blockerCount: Int) {
+        if PowerInfo.sleepDisabled() {
+            if PowerInfo.resetDisableSleep() {
+                Log.write("检测到 SleepDisabled=1,已复位 disablesleep=0")
+            } else {
+                Log.write("SleepDisabled=1 且复位失败:需为 pmset -a disablesleep 0 配 sudoers 免密,否则无法强制睡")
+                DispatchQueue.main.async { self.lastFailedAt = Date() }
+                return
+            }
+        }
+
+        let ok = PowerInfo.forceSleep()
+        DispatchQueue.main.async {
+            if ok {
+                // 只有真发出睡眠请求才记冷却 + 证据,并清掉失败退避
+                self.lastForcedAt = Date()
+                self.lastFailedAt = nil
+                UserDefaults.standard.set(Date(), forKey: self.lastSleepKey)
+                UserDefaults.standard.set(blockerCount, forKey: self.lastSleepCountKey)
+            } else {
+                self.lastFailedAt = Date()
+            }
+        }
+        Log.write(ok
+            ? "pmset 睡眠请求已发出(退出码 0)"
+            : "pmset 失败,未睡成(退避 \(Int(failBackoff))s 后可重试)")
     }
 
     // MARK: - 菜单栏图标
@@ -125,7 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             symbol = "moon.fill"             // 正常待命
         }
-        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "HiSleep")
+        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "ShutEye")
         img?.isTemplate = true
         button.image = img
     }
@@ -141,7 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu(_ menu: NSMenu, blockers: [DisplayBlocker]) {
         menu.removeAllItems()
 
-        let header = NSMenuItem(title: "HiSleep — 合盖即睡", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "ShutEye — 合盖即睡", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
         menu.addItem(.separator())
@@ -192,7 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         openLog.target = self
         menu.addItem(openLog)
 
-        let quit = NSMenuItem(title: "退出 HiSleep", action: #selector(quitAction), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "退出 ShutEye", action: #selector(quitAction), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }
@@ -200,11 +268,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleEnabled() { enabled.toggle() }
 
     @objc private func sleepNowAction() {
-        lastForcedAt = Date()
         Log.writeSync("手动「立即睡眠」")
+        let blockerCount = PowerInfo.rawBlockers().count
         DispatchQueue.global(qos: .userInitiated).async {
-            let ok = PowerInfo.forceSleep()
-            Log.write(ok ? "手动睡眠请求已发出" : "手动睡眠失败")
+            self.performForceSleep(blockerCount: blockerCount)
         }
     }
 

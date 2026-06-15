@@ -1,4 +1,4 @@
-# HiSleep
+# ShutEye
 
 让 MacBook「该睡就睡」。合盖时无视流氓 App 的 power assertion,强制摁进睡眠。
 
@@ -17,7 +17,7 @@
 
 ```bash
 swift build -c release
-.build/release/HiSleep
+.build/release/ShutEye
 ```
 
 或开发期直接:
@@ -35,7 +35,7 @@ swift run
 1. **菜单里看**:重新开盖,点菜单栏图标 → 顶部有「上次强制睡眠: MM-dd HH:mm:ss(拦睡 N)」。
    有这行、时间对得上你合盖的时刻 = 它动手了。
 
-2. **App 日志**:菜单点「查看日志」,或直接看 `~/Library/Logs/HiSleep.log`。会有完整链路:
+2. **App 日志**:菜单点「查看日志」,或直接看 `~/Library/Logs/ShutEye.log`。会有完整链路:
    ```
    ... 检测到合盖(上升沿)
    ... 守卫通过 → 执行 pmset sleepnow。当时拦睡 4: ToDesk — UserIdleSystemSleep, ...
@@ -55,8 +55,8 @@ swift run
 最简单的方式,建一个 LaunchAgent:
 
 1. 先 `swift build -c release`,记下二进制绝对路径:
-   `/Volumes/HoseaExtension/CodeWork/Project/HiSleep/.build/release/HiSleep`
-2. 新建 `~/Library/LaunchAgents/com.hosea.hisleep.plist`:
+   `/Volumes/HoseaExtension/CodeWork/Project/ShutEye/.build/release/ShutEye`
+2. 新建 `~/Library/LaunchAgents/com.hosea.shuteye.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -65,10 +65,10 @@ swift run
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.hosea.hisleep</string>
+    <string>com.hosea.shuteye</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Volumes/HoseaExtension/CodeWork/Project/HiSleep/.build/release/HiSleep</string>
+        <string>/Volumes/HoseaExtension/CodeWork/Project/ShutEye/.build/release/ShutEye</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -78,7 +78,7 @@ swift run
 </plist>
 ```
 
-3. 加载:`launchctl load ~/Library/LaunchAgents/com.hosea.hisleep.plist`
+3. 加载:`launchctl load ~/Library/LaunchAgents/com.hosea.shuteye.plist`
 
 > 注:二进制放在外接卷(`/Volumes/...`)上,卷没挂载时自启会失败。
 > 若要稳妥,把 release 二进制拷到 `~/Applications/` 或本机磁盘再指过去。

@@ -136,24 +136,64 @@ enum PowerInfo {
         return (path as NSString).lastPathComponent
     }
 
-    /// 强制立即睡眠。pmset sleepnow 走 power management 路径,能绕过 idle 声明,无需 sudo。
-    /// 等待退出并检查退出码 —— 返回 true 才表示请求真的发出去了(不保证 powerd 一定接受)。
-    @discardableResult
-    static func forceSleep() -> Bool {
+    /// 跑一个外部命令,返回 (退出码, stdout+stderr 合并后的文本)。退出码 -1 表示无法启动。
+    private static func runProcess(_ path: String, _ args: [String]) -> (code: Int32, output: String) {
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        task.arguments = ["sleepnow"]
+        task.executableURL = URL(fileURLWithPath: path)
+        task.arguments = args
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
         do {
             try task.run()
+            // 先读尽输出再 wait,避免管道写满死锁
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             task.waitUntilExit()
-            if task.terminationStatus != 0 {
-                NSLog("HiSleep: pmset sleepnow 退出码 \(task.terminationStatus)")
-                return false
-            }
-            return true
+            let text = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return (task.terminationStatus, text)
         } catch {
-            NSLog("HiSleep: pmset sleepnow 启动失败: \(error)")
+            NSLog("ShutEye: 执行 \(path) \(args.joined(separator: " ")) 失败: \(error)")
+            return (-1, error.localizedDescription)
+        }
+    }
+
+    /// 系统是否被设了全局 disablesleep(`pmset -g` 里的 SleepDisabled 行为 1)。
+    /// 开着时连 root 的 `pmset sleepnow` 都会被拒(kIOReturnNotPermitted / 0xe00002e2)。
+    /// 读不到则按 false 处理。
+    static func sleepDisabled() -> Bool {
+        let (_, out) = runProcess("/usr/bin/pmset", ["-g"])
+        for line in out.split(separator: "\n") where line.contains("SleepDisabled") {
+            let value = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).last
+            return String(value ?? "") == "1"
+        }
+        return false
+    }
+
+    /// 复位全局 disablesleep 为 0。需要 root,走 `sudo -n`(非交互、绝不弹密码):
+    /// 必须先配 sudoers 免密规则 `NOPASSWD: /usr/bin/pmset -a disablesleep 0`,否则直接失败。
+    /// 返回 true 表示已复位。
+    @discardableResult
+    static func resetDisableSleep() -> Bool {
+        let (code, out) = runProcess("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", "0"])
+        if code != 0 {
+            NSLog("ShutEye: 复位 disablesleep 失败(退出码 \(code)): \(out)")
+        }
+        return code == 0
+    }
+
+    /// 强制立即睡眠。pmset sleepnow 走 power management 路径,能绕过 idle 声明。
+    /// 返回 true 才表示请求真的发出去了(退出码 0;不保证 powerd 一定接受)。
+    /// 注意:若系统 SleepDisabled=1,连 root 也会被拒 —— 调用方应先调 resetDisableSleep()。
+    @discardableResult
+    static func forceSleep() -> Bool {
+        // pmset 把 "Unable to sleep system" 写到 stdout(stderr 是空的),runProcess 两路都抓
+        let (code, out) = runProcess("/usr/bin/pmset", ["sleepnow"])
+        if code != 0 {
+            NSLog("ShutEye: pmset sleepnow 退出码 \(code) \(out)")
+            Log.write("pmset 失败(退出码 \(code)): \(out)")
             return false
         }
+        return true
     }
 }

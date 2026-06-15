@@ -2,14 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "HiSleep",
+    name: "ShutEye",
     platforms: [
         .macOS(.v13)
     ],
     targets: [
         .executableTarget(
-            name: "HiSleep",
-            path: "Sources/HiSleep"
+            name: "ShutEye",
+            path: "Sources/ShutEye"
         )
     ]
 )

@@ -18,5 +18,10 @@ DerivedData/
 .idea/
 *.swp
 
-# 运行产物 / 日志(HiSleep 日志写在 ~/Library/Logs,不在仓库内,这里只防误放)
+# 运行产物 / 日志(ShutEye 日志写在 ~/Library/Logs,不在仓库内,这里只防误放)
 *.log
+
+# 打包产物
+ShutEye.app/
+dist/
+*.zip

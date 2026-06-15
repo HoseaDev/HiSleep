@@ -1,16 +1,16 @@
 import Foundation
 
-/// 把事件追加写到 ~/Library/Logs/HiSleep.log,同时走 NSLog。
+/// 把事件追加写到 ~/Library/Logs/ShutEye.log,同时走 NSLog。
 /// 合盖后看不到屏幕,事后用这个文件确认到底发生了什么。
 enum Log {
 
     static let fileURL: URL = {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs", isDirectory: true)
-        return dir.appendingPathComponent("HiSleep.log")
+        return dir.appendingPathComponent("ShutEye.log")
     }()
 
-    private static let queue = DispatchQueue(label: "com.hosea.hisleep.log")
+    private static let queue = DispatchQueue(label: "com.hosea.shuteye.log")
 
     // DateFormatter 不是线程安全的 → 只在串行队列内使用。
     private static let formatter: DateFormatter = {
@@ -21,13 +21,13 @@ enum Log {
 
     /// 异步写。普通事件用这个,不阻塞调用方。
     static func write(_ message: String) {
-        NSLog("HiSleep: \(message)")
+        NSLog("ShutEye: \(message)")
         queue.async { append(message) }
     }
 
     /// 同步写。合盖→睡眠这种关键路径用这个:确保日志在机器睡着前已经落盘。
     static func writeSync(_ message: String) {
-        NSLog("HiSleep: \(message)")
+        NSLog("ShutEye: \(message)")
         queue.sync { append(message) }
     }
 
@@ -40,7 +40,7 @@ enum Log {
 
         if !fm.fileExists(atPath: path) {
             if !fm.createFile(atPath: path, contents: data) {
-                NSLog("HiSleep: 无法创建日志文件 \(path)")
+                NSLog("ShutEye: 无法创建日志文件 \(path)")
             }
             return
         }
